@@ -1,0 +1,639 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+const featureLabels = [
+  'Noise reduction',
+  'Silence trimming',
+  'MFCC feature map',
+  'Speaker embedding',
+  'Anti-spoof check',
+  'Similarity scoring',
+];
+
+const sampleScores = [92, 88, 95, 90, 97];
+const ambientParticles = Array.from({ length: 14 }, (_, index) => ({
+  id: index,
+  size: 6 + (index % 4) * 4,
+  x: (index * 13) % 100,
+  y: (index * 19) % 100,
+  delay: index * 0.7,
+  duration: 10 + (index % 5) * 2,
+  tint: index % 3,
+}));
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function formatTime(seconds) {
+  const whole = Math.max(0, Math.floor(seconds));
+  const mins = String(Math.floor(whole / 60)).padStart(2, '0');
+  const secs = String(whole % 60).padStart(2, '0');
+  return `${mins}:${secs}`;
+}
+
+function hashBytes(bytes) {
+  let hash = 2166136261;
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+async function blobToAudioBuffer(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioContext = new AudioContext();
+  try {
+    return await audioContext.decodeAudioData(arrayBuffer.slice(0));
+  } finally {
+    await audioContext.close();
+  }
+}
+
+function analyzeAudioBuffer(buffer) {
+  const channel = buffer.getChannelData(0);
+  const length = channel.length;
+  let sumSquares = 0;
+  let zeroCrossings = 0;
+  let peak = 0;
+
+  for (let index = 0; index < length; index += 1) {
+    const value = channel[index];
+    sumSquares += value * value;
+    peak = Math.max(peak, Math.abs(value));
+    if (index > 0 && (value >= 0) !== (channel[index - 1] >= 0)) {
+      zeroCrossings += 1;
+    }
+  }
+
+  const rms = Math.sqrt(sumSquares / Math.max(1, length));
+  const zcr = zeroCrossings / Math.max(1, length / buffer.sampleRate);
+  const loudness = clamp(Math.round(rms * 180), 5, 100);
+  const clarity = clamp(Math.round((1 - Math.abs(zcr - 120) / 180) * 100), 20, 99);
+  const stability = clamp(Math.round((1 - Math.abs(peak - 0.6)) * 120), 35, 99);
+
+  return {
+    loudness,
+    clarity,
+    stability,
+    duration: buffer.duration,
+    rms,
+    zcr,
+    peak,
+  };
+}
+
+function scoreAudio(buffer, mode) {
+  const metrics = analyzeAudioBuffer(buffer);
+  const sampleWindow = buffer.length > 65536 ? 65536 : buffer.length;
+  const seed = hashBytes(new Uint8Array(sampleWindow));
+  const embeddingScore = clamp(Math.round((metrics.loudness + metrics.clarity + metrics.stability) / 3), 0, 100);
+  const spoofScore = clamp(Math.round(100 - (metrics.zcr % 40) - metrics.peak * 15), 12, 99);
+  const voiceSimilarity = clamp(Math.round(embeddingScore * 0.72 + (seed % 19) + (mode === 'enroll' ? 4 : -3)), 0, 100);
+  const antiSpoofConfidence = clamp(Math.round((spoofScore + metrics.stability) / 2), 0, 100);
+
+  return {
+    metrics,
+    embeddingScore,
+    spoofScore,
+    voiceSimilarity,
+    antiSpoofConfidence,
+  };
+}
+
+function LoginView({ onLoginSuccess }) {
+  const [userId, setUserId] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  const isValidGmail = (email) => {
+    const gmailRegex = /^[a-zA-Z0-9._%+-]+@gmail\.com$/;
+    return gmailRegex.test(email);
+  };
+
+  const isValidPassword = (pass) => {
+    const hasCapitalLetter = /[A-Z]/.test(pass);
+    const hasNumbers = /\d/.test(pass);
+    return hasCapitalLetter && hasNumbers;
+  };
+
+  const handleLogin = () => {
+    if (!userId.trim() || !password.trim()) {
+      setError('Please enter both user ID and password');
+      return;
+    }
+
+    if (!isValidGmail(userId)) {
+      setError('User ID must be a valid Gmail address (e.g., example@gmail.com)');
+      return;
+    }
+
+    if (!isValidPassword(password)) {
+      setError('Password must contain at least 1 capital letter and numbers (e.g., Abc123)');
+      return;
+    }
+
+    setIsLoading(true);
+    setTimeout(() => {
+      localStorage.setItem('voiceAuthUser', JSON.stringify({ userId, timestamp: Date.now(), authMethod: 'standard' }));
+      onLoginSuccess({ userId });
+      setIsLoading(false);
+    }, 600);
+  };
+
+  const handleGmailSignIn = () => {
+    setIsLoading(true);
+    setTimeout(() => {
+      const mockGmailUser = 'user@gmail.com';
+      localStorage.setItem('voiceAuthUser', JSON.stringify({ userId: mockGmailUser, timestamp: Date.now(), authMethod: 'gmail' }));
+      onLoginSuccess({ userId: mockGmailUser });
+      setIsLoading(false);
+    }, 800);
+  };
+
+  const handleKeyPress = (event) => {
+    if (event.key === 'Enter') {
+      handleLogin();
+    }
+  };
+
+  return (
+    <div className="auth-container">
+      <div className="auth-surface" aria-hidden="true">
+        <span className="surface-orb surface-orb-a" />
+        <span className="surface-orb surface-orb-b" />
+        <span className="surface-ripple" />
+        <div className="ambient-particles">
+          {ambientParticles.map((particle) => (
+            <span
+              key={particle.id}
+              className={`ambient-particle tint-${particle.tint}`}
+              style={{
+                '--particle-size': `${particle.size}px`,
+                '--particle-x': `${particle.x}%`,
+                '--particle-y': `${particle.y}%`,
+                '--particle-delay': `${particle.delay}s`,
+                '--particle-duration': `${particle.duration}s`,
+              }}
+            />
+          ))}
+        </div>
+      </div>
+
+      <div className="auth-card">
+        <div className="auth-header">
+          <h1>Voice Authentication</h1>
+          <p>Secure biometric login</p>
+        </div>
+
+        <div className="auth-form">
+          <div className="form-group">
+            <label htmlFor="userId">Gmail Address</label>
+            <input
+              id="userId"
+              type="email"
+              placeholder="Enter your Gmail (e.g., user@gmail.com)"
+              value={userId}
+              onChange={(e) => {
+                setUserId(e.target.value);
+                setError('');
+              }}
+              onKeyPress={handleKeyPress}
+              disabled={isLoading}
+            />
+          </div>
+
+          <div className="form-group">
+            <label htmlFor="password">Password</label>
+            <input
+              id="password"
+              type="password"
+              placeholder="Password (e.g., Abc123)"
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                setError('');
+              }}
+              onKeyPress={handleKeyPress}
+              disabled={isLoading}
+            />
+            <small style={{ color: '#888', marginTop: '4px', display: 'block' }}>
+              Must contain: 1 capital letter + numbers
+            </small>
+          </div>
+
+          {error && <div className="form-error">{error}</div>}
+
+          <button
+            className="auth-submit"
+            onClick={handleLogin}
+            disabled={isLoading}
+          >
+            {isLoading ? 'Logging in...' : 'Login with Credentials'}
+          </button>
+
+          <div style={{ textAlign: 'center', margin: '16px 0', color: '#666', fontSize: '14px' }}>
+            OR
+          </div>
+
+          <button
+            className="auth-submit"
+            onClick={handleGmailSignIn}
+            disabled={isLoading}
+            style={{ backgroundColor: '#4285F4', opacity: isLoading ? '0.6' : '1' }}
+          >
+            {isLoading ? 'Signing in...' : 'Sign in with Gmail'}
+          </button>
+        </div>
+
+        <div className="auth-footer">
+          <p>Standard login requires Gmail address + password with capital letter & numbers</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function VoiceAuthView({ user, onLogout }) {
+  const shellRef = useRef(null);
+  const recorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const streamRef = useRef(null);
+  const animationRef = useRef(null);
+  const startedAtRef = useRef(0);
+
+  const [mode, setMode] = useState('enroll');
+  const [status, setStatus] = useState('Ready to capture voice');
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedUrl, setRecordedUrl] = useState('');
+  const [audioDuration, setAudioDuration] = useState(0);
+  const [enrolledProfile, setEnrolledProfile] = useState(null);
+  const [analysis, setAnalysis] = useState({
+    embeddingScore: 0,
+    spoofScore: 0,
+    voiceSimilarity: 0,
+    antiSpoofConfidence: 0,
+    metrics: { loudness: 0, clarity: 0, stability: 0, duration: 0 },
+  });
+  const [decision, setDecision] = useState('Awaiting audio sample');
+  const [waveform, setWaveform] = useState(Array.from({ length: 24 }, (_, index) => 20 + (index % 4) * 12));
+
+  const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  useEffect(() => {
+    return () => {
+      if (recordedUrl) {
+        URL.revokeObjectURL(recordedUrl);
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+      }
+    };
+  }, [recordedUrl]);
+
+  useEffect(() => {
+    if (!isRecording) {
+      return undefined;
+    }
+
+    const tick = () => {
+      const elapsed = (Date.now() - startedAtRef.current) / 1000;
+      const bars = Array.from({ length: 24 }, (_, index) => {
+        const phase = elapsed * 2 + index * 0.45;
+        const raw = 34 + Math.abs(Math.sin(phase) * 44) + Math.abs(Math.cos(phase * 0.6) * 12);
+        return clamp(Math.round(raw), 10, 98);
+      });
+      setWaveform(bars);
+      animationRef.current = requestAnimationFrame(tick);
+    };
+
+    animationRef.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animationRef.current);
+  }, [isRecording]);
+
+  const enrollmentStats = useMemo(() => {
+    if (!enrolledProfile) {
+      return null;
+    }
+
+    return [
+      { label: 'Template similarity', value: `${enrolledProfile.voiceSimilarity}%` },
+      { label: 'Anti-spoof confidence', value: `${enrolledProfile.antiSpoofConfidence}%` },
+      { label: 'Profile duration', value: `${enrolledProfile.metrics.duration.toFixed(1)}s` },
+    ];
+  }, [enrolledProfile]);
+
+  async function startCapture() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatus('Microphone access is unavailable in this browser');
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      chunksRef.current = [];
+      streamRef.current = stream;
+      recorderRef.current = recorder;
+      startedAtRef.current = Date.now();
+      setIsRecording(true);
+      setStatus('Listening for your passphrase');
+      setDecision('Recording in progress');
+      setAudioDuration(0);
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        const audioBlob = new Blob(chunksRef.current, { type: 'audio/webm' });
+        const nextUrl = URL.createObjectURL(audioBlob);
+        const buffer = await blobToAudioBuffer(audioBlob);
+        const nextAnalysis = scoreAudio(buffer, mode);
+        const nextDuration = buffer.duration;
+        const isSpoofed = nextAnalysis.antiSpoofConfidence < 58 || nextAnalysis.spoofScore < 55;
+        const templateMatch = enrolledProfile
+          ? Math.round(enrolledProfile.voiceSimilarity * 0.55 + nextAnalysis.voiceSimilarity * 0.45)
+          : nextAnalysis.voiceSimilarity;
+        const accepted = !isSpoofed && templateMatch >= 72;
+
+        if (recordedUrl) {
+          URL.revokeObjectURL(recordedUrl);
+        }
+
+        setRecordedUrl(nextUrl);
+        setAudioDuration(nextDuration);
+        setAnalysis(nextAnalysis);
+        setDecision(accepted ? 'Access granted' : 'Access denied');
+        setStatus(accepted ? 'Verified as the enrolled speaker' : isSpoofed ? 'Possible spoof detected' : 'Speaker mismatch detected');
+
+        if (mode === 'enroll') {
+          setEnrolledProfile(nextAnalysis);
+        }
+
+        stream.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+        recorderRef.current = null;
+        setIsRecording(false);
+      };
+
+      recorder.start();
+      window.setTimeout(() => {
+        if (recorder.state === 'recording') {
+          recorder.stop();
+        }
+      }, mode === 'enroll' ? 4500 : 3500);
+    } catch (error) {
+      setStatus('Microphone permission denied or unavailable');
+      setDecision(error instanceof Error ? error.message : 'Unable to access microphone');
+      setIsRecording(false);
+    }
+  }
+
+  function stopCapture() {
+    if (recorderRef.current && recorderRef.current.state === 'recording') {
+      recorderRef.current.stop();
+    }
+  }
+
+  function syncPointer(event) {
+    if (!shellRef.current) {
+      return;
+    }
+
+    const bounds = shellRef.current.getBoundingClientRect();
+    const pointerX = ((event.clientX - bounds.left) / bounds.width) * 100;
+    const pointerY = ((event.clientY - bounds.top) / bounds.height) * 100;
+    shellRef.current.style.setProperty('--pointer-x', `${clamp(pointerX, 0, 100)}%`);
+    shellRef.current.style.setProperty('--pointer-y', `${clamp(pointerY, 0, 100)}%`);
+  }
+
+  function clearPointer() {
+    if (!shellRef.current) {
+      return;
+    }
+
+    shellRef.current.style.setProperty('--pointer-x', '50%');
+    shellRef.current.style.setProperty('--pointer-y', '18%');
+  }
+
+  const progressValue = enrolledProfile ? analysis.voiceSimilarity : analysis.embeddingScore;
+
+  return (
+    <div className="app-wrapper">
+      <div className="app-navbar">
+        <div className="navbar-content">
+          <h2>{user.userId}</h2>
+          <button className="logout-btn" onClick={onLogout}>Logout</button>
+        </div>
+      </div>
+
+      <main className="shell" ref={shellRef} onPointerMove={syncPointer} onPointerLeave={clearPointer}>
+        <section className="hero card">
+          <div className="hero-surface" aria-hidden="true">
+            <span className="surface-orb surface-orb-a" />
+            <span className="surface-orb surface-orb-b" />
+            <span className="surface-ripple" />
+            <div className="ambient-particles">
+              {ambientParticles.map((particle) => (
+                <span
+                  key={particle.id}
+                  className={`ambient-particle tint-${particle.tint}`}
+                  style={{
+                    '--particle-size': `${particle.size}px`,
+                    '--particle-x': `${(particle.x + 9) % 100}%`,
+                    '--particle-y': `${(particle.y + 11) % 100}%`,
+                    '--particle-delay': `${particle.delay}s`,
+                    '--particle-duration': `${particle.duration + 2}s`,
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+          <div className="hero-copy">
+            <p className="eyebrow">Deep-learning voice authentication</p>
+            <h1>Secure login with voiceprint verification and anti-spoofing defense.</h1>
+            <p className="lede">
+              This demo captures speech in the browser, simulates a speaker embedding pipeline,
+              and combines it with a spoof check before granting access.
+            </p>
+
+            <div className="hero-actions">
+              <button className="primary" onClick={startCapture} disabled={isRecording}>
+                {isRecording ? 'Recording...' : mode === 'enroll' ? 'Enroll voice' : 'Verify voice'}
+              </button>
+              <button className="secondary" onClick={stopCapture} disabled={!isRecording}>
+                Stop capture
+              </button>
+            </div>
+
+            <div className="mode-switch" role="tablist" aria-label="Authentication mode">
+              <button className={mode === 'enroll' ? 'mode active' : 'mode'} onClick={() => setMode('enroll')}>
+                Enrollment
+              </button>
+              <button className={mode === 'login' ? 'mode active' : 'mode'} onClick={() => setMode('login')}>
+                Login
+              </button>
+            </div>
+          </div>
+
+          <div className="status-panel">
+            <div className="status-ring">
+              <div className="status-ring-inner">
+                <span>{progressValue}%</span>
+                <small>{mode === 'enroll' ? 'voiceprint strength' : 'match confidence'}</small>
+              </div>
+            </div>
+            <div className="status-copy">
+              <p className="status-label">Current status</p>
+              <p className="status-value">{status}</p>
+              <p className="status-note">{decision}</p>
+            </div>
+          </div>
+        </section>
+
+        <section className="grid two-up">
+          <article className="card capture-card">
+            <div className="card-header">
+              <h2>Live capture</h2>
+              <span>{formatTime(audioDuration)}</span>
+            </div>
+
+            <div className="waveform" aria-hidden="true">
+              {waveform.map((bar, index) => (
+                <span key={index} style={{ height: `${bar}%` }} />
+              ))}
+            </div>
+
+            <p className="caption">
+              Speak a passphrase clearly. The microphone stream is preprocessed, analyzed, and scored in real time.
+            </p>
+          </article>
+
+          <article className="card metrics-card">
+            <div className="card-header">
+              <h2>Authentication metrics</h2>
+              <span>On-device pipeline</span>
+            </div>
+
+            <div className="metric-grid">
+              <div className="metric">
+                <strong>{analysis.embeddingScore}%</strong>
+                <span>Embedding quality</span>
+              </div>
+              <div className="metric">
+                <strong>{analysis.voiceSimilarity}%</strong>
+                <span>Speaker similarity</span>
+              </div>
+              <div className="metric">
+                <strong>{analysis.antiSpoofConfidence}%</strong>
+                <span>Anti-spoof confidence</span>
+              </div>
+              <div className="metric">
+                <strong>{analysis.spoofScore}%</strong>
+                <span>Live speech score</span>
+              </div>
+            </div>
+
+            <div className="feature-list">
+              {featureLabels.map((label, index) => (
+                <div key={label} className="feature-item">
+                  <span>{index + 1}</span>
+                  <p>{label}</p>
+                </div>
+              ))}
+            </div>
+          </article>
+        </section>
+
+        <section className="grid bottom-grid">
+          <article className="card data-card">
+            <div className="card-header">
+              <h2>Enrollment profile</h2>
+              <span>{enrolledProfile ? 'Stored voiceprint ready' : 'No enrolled speaker yet'}</span>
+            </div>
+
+            {enrolledProfile ? (
+              <div className="profile-details">
+                {enrollmentStats?.map((item) => (
+                  <div key={item.label} className="profile-row">
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="empty-state">
+                Capture an enrollment sample first. The app will store a template voiceprint for later login checks.
+              </p>
+            )}
+          </article>
+
+          <article className="card usecase-card">
+            <div className="card-header">
+              <h2>Banking use case</h2>
+              <span>Voice as a biometric factor</span>
+            </div>
+            <p>
+              A customer speaks a passphrase to unlock account access. The system verifies both speaker identity
+              and speech liveness before permitting a sensitive action such as viewing balances or confirming a transfer.
+            </p>
+            <div className="score-bars">
+              {sampleScores.map((score, index) => (
+                <div key={score} className="score-row">
+                  <span>Model {index + 1}</span>
+                  <div className="score-track">
+                    <div style={{ width: `${score}%` }} />
+                  </div>
+                  <strong>{score}%</strong>
+                </div>
+              ))}
+            </div>
+          </article>
+        </section>
+
+        {recordedUrl ? (
+          <section className="card audio-card">
+            <div className="card-header">
+              <h2>Captured sample</h2>
+              <span>Review the recorded clip</span>
+            </div>
+            <audio controls src={recordedUrl} />
+          </section>
+        ) : null}
+      </main>
+    </div>
+  );
+}
+
+export default function App() {
+  const [user, setUser] = useState(null);
+
+  useEffect(() => {
+    const storedUser = localStorage.getItem('voiceAuthUser');
+    if (storedUser) {
+      try {
+        setUser(JSON.parse(storedUser));
+      } catch {
+        localStorage.removeItem('voiceAuthUser');
+      }
+    }
+  }, []);
+
+  const handleLoginSuccess = (userData) => {
+    setUser(userData);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('voiceAuthUser');
+    setUser(null);
+  };
+
+  if (!user) {
+    return <LoginView onLoginSuccess={handleLoginSuccess} />;
+  }
+
+  return <VoiceAuthView user={user} onLogout={handleLogout} />;
+}
